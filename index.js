@@ -1,3 +1,6 @@
+// Load environment variables
+require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -7,34 +10,76 @@ const { body, validationResult } = require('express-validator');
 
 const app = express();
 
-// Environment Variables
+// Environment variables with fallbacks
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
+const PORT = process.env.PORT || 5000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// Validate required environment variables
+if (!MONGODB_URI) {
+  console.error(' MONGODB_URI is required in environment variables');
+  process.exit(1);
+}
+if (!JWT_SECRET) {
+  console.error(' JWT_SECRET is required in environment variables');
+  process.exit(1);
+}
+
+// CORS configuration - support multiple origins
+const corsOrigins = process.env.CORS_ORIGIN 
+  ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
+  : ['http://localhost:3000'];
 
 // Middleware
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (corsOrigins.includes(origin) || NODE_ENV === 'development') {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// MongoDB Connection with caching for serverless
+// MongoDB Connection - Optimized for serverless (Vercel)
 let cachedDb = null;
 
 async function connectToDatabase() {
-  if (cachedDb) {
+  if (cachedDb && mongoose.connection.readyState === 1) {
     return cachedDb;
   }
 
-  const connection = await mongoose.connect(MONGODB_URI, {
-    serverSelectionTimeoutMS: 5000,
-    socketTimeoutMS: 45000,
-  });
+  try {
+    const options = {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000
+    };
 
-  cachedDb = connection;
-  console.log(' MongoDB Connected Successfully');
-  return connection;
+    await mongoose.connect(MONGODB_URI, options);
+    cachedDb = mongoose.connection;
+    console.log(' MongoDB Connected Successfully');
+    return cachedDb;
+  } catch (error) {
+    console.error(' MongoDB Connection Error:', error);
+    throw error;
+  }
+}
+
+// Connect to database on startup (for localhost)
+if (NODE_ENV !== 'production' || process.env.VERCEL !== '1') {
+  connectToDatabase().catch(err => {
+    console.error('Failed to connect to MongoDB:', err);
+  });
 }
 
 // MongoDB Schemas
@@ -43,7 +88,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   image: { type: String, default: '' },
   googleId: { type: String, unique: true, sparse: true },
-  password: { type: String },
+  password: { type: String }, // For credential-based auth
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -67,8 +112,8 @@ const blogPostSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-const User = mongoose.models.User || mongoose.model('User', userSchema);
-const BlogPost = mongoose.models.BlogPost || mongoose.model('BlogPost', blogPostSchema);
+const User = mongoose.model('User', userSchema);
+const BlogPost = mongoose.model('BlogPost', blogPostSchema);
 
 // JWT Middleware
 const authenticateToken = (req, res, next) => {
@@ -88,15 +133,24 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// Database connection middleware for serverless functions
+const ensureDbConnection = async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    res.status(500).json({ error: 'Database connection failed' });
+  }
+};
+
 // ==================== AUTH ROUTES ====================
 
-app.post('/api/auth/register', [
+// Register with credentials
+app.post('/api/auth/register', ensureDbConnection, [
   body('email').isEmail().withMessage('Valid email required'),
   body('name').trim().notEmpty().withMessage('Name required'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
 ], async (req, res) => {
-  await connectToDatabase();
-  
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -126,12 +180,11 @@ app.post('/api/auth/register', [
   }
 });
 
-app.post('/api/auth/login', [
+// Login with credentials
+app.post('/api/auth/login', ensureDbConnection, [
   body('email').isEmail().withMessage('Valid email required'),
   body('password').notEmpty().withMessage('Password required')
 ], async (req, res) => {
-  await connectToDatabase();
-  
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -162,9 +215,8 @@ app.post('/api/auth/login', [
   }
 });
 
-app.post('/api/auth/google', async (req, res) => {
-  await connectToDatabase();
-  
+// Google OAuth user sync (NextAuth will handle OAuth, this creates/updates user in our DB)
+app.post('/api/auth/google', ensureDbConnection, async (req, res) => {
   try {
     const { email, name, image, googleId } = req.body;
 
@@ -192,9 +244,8 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-app.get('/api/auth/me', authenticateToken, async (req, res) => {
-  await connectToDatabase();
-  
+// Get current user
+app.get('/api/auth/me', ensureDbConnection, authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId).select('-password');
     if (!user) {
@@ -208,14 +259,14 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
 // ==================== BLOG POST ROUTES ====================
 
-app.get('/api/blogs', async (req, res) => {
-  await connectToDatabase();
-  
+// Get all blog posts (with filters, search, sort)
+app.get('/api/blogs', ensureDbConnection, async (req, res) => {
   try {
     const { search, category, sortBy, status } = req.query;
     
     let query = {};
     
+    // Search by title or content
     if (search) {
       query.$or = [
         { title: { $regex: search, $options: 'i' } },
@@ -224,19 +275,22 @@ app.get('/api/blogs', async (req, res) => {
       ];
     }
     
+    // Filter by category
     if (category && category !== 'All') {
       query.category = category;
     }
     
+    // Filter by status (default: published only)
     query.status = status || 'published';
     
+    // Sort options
     let sortOptions = {};
     if (sortBy === 'likes') {
       sortOptions = { likes: -1 };
     } else if (sortBy === 'views') {
       sortOptions = { viewCount: -1 };
     } else {
-      sortOptions = { createdAt: -1 };
+      sortOptions = { createdAt: -1 }; // Latest by default
     }
     
     const blogs = await BlogPost.find(query)
@@ -244,10 +298,11 @@ app.get('/api/blogs', async (req, res) => {
       .sort(sortOptions)
       .lean();
     
+    // Add like count to each blog
     const blogsWithCounts = blogs.map(blog => ({
       ...blog,
       likeCount: blog.likes.length,
-      commentCount: 0
+      commentCount: 0 // Placeholder for future comments feature
     }));
     
     res.json({ blogs: blogsWithCounts, total: blogsWithCounts.length });
@@ -256,9 +311,8 @@ app.get('/api/blogs', async (req, res) => {
   }
 });
 
-app.get('/api/blogs/:id', async (req, res) => {
-  await connectToDatabase();
-  
+// Get single blog post by ID
+app.get('/api/blogs/:id', ensureDbConnection, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id)
       .populate('authorId', 'name email image');
@@ -267,6 +321,7 @@ app.get('/api/blogs/:id', async (req, res) => {
       return res.status(404).json({ error: 'Blog post not found' });
     }
     
+    // Increment view count
     blog.viewCount += 1;
     await blog.save();
     
@@ -281,14 +336,13 @@ app.get('/api/blogs/:id', async (req, res) => {
   }
 });
 
-app.post('/api/blogs', authenticateToken, [
+// Create new blog post (protected)
+app.post('/api/blogs', ensureDbConnection, authenticateToken, [
   body('title').trim().notEmpty().withMessage('Title required'),
   body('excerpt').trim().notEmpty().isLength({ max: 150 }).withMessage('Excerpt required (max 150 chars)'),
   body('content').trim().notEmpty().withMessage('Content required'),
   body('category').isIn(['Freestyle', 'Racing', 'Cinematic', 'Builds', 'Reviews', 'Tips']).withMessage('Valid category required')
 ], async (req, res) => {
-  await connectToDatabase();
-  
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -305,7 +359,7 @@ app.post('/api/blogs', authenticateToken, [
       category,
       tags: tags || [],
       featuredImage: featuredImage || '',
-      readTime: readTime || Math.ceil(content.split(' ').length / 200),
+      readTime: readTime || Math.ceil(content.split(' ').length / 200), // Auto-calculate
       status: status || 'published'
     });
     
@@ -323,9 +377,8 @@ app.post('/api/blogs', authenticateToken, [
   }
 });
 
-app.put('/api/blogs/:id', authenticateToken, async (req, res) => {
-  await connectToDatabase();
-  
+// Update blog post (protected, author only)
+app.put('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -363,9 +416,8 @@ app.put('/api/blogs/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/blogs/:id', authenticateToken, async (req, res) => {
-  await connectToDatabase();
-  
+// Delete blog post (protected, author only)
+app.delete('/api/blogs/:id', ensureDbConnection, authenticateToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -385,9 +437,8 @@ app.delete('/api/blogs/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/blogs/user/my-posts', authenticateToken, async (req, res) => {
-  await connectToDatabase();
-  
+// Get user's own blog posts (protected)
+app.get('/api/blogs/user/my-posts', ensureDbConnection, authenticateToken, async (req, res) => {
   try {
     const blogs = await BlogPost.find({ authorId: req.user.userId })
       .sort({ createdAt: -1 })
@@ -415,9 +466,8 @@ app.get('/api/blogs/user/my-posts', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/blogs/:id/like', authenticateToken, async (req, res) => {
-  await connectToDatabase();
-  
+// Like/Unlike blog post (protected)
+app.post('/api/blogs/:id/like', ensureDbConnection, authenticateToken, async (req, res) => {
   try {
     const blog = await BlogPost.findById(req.params.id);
     
@@ -429,10 +479,12 @@ app.post('/api/blogs/:id/like', authenticateToken, async (req, res) => {
     const likeIndex = blog.likes.indexOf(userId);
     
     if (likeIndex > -1) {
+      // Unlike
       blog.likes.splice(likeIndex, 1);
       await blog.save();
       res.json({ message: 'Blog post unliked', liked: false, likeCount: blog.likes.length });
     } else {
+      // Like
       blog.likes.push(userId);
       await blog.save();
       res.json({ message: 'Blog post liked', liked: true, likeCount: blog.likes.length });
@@ -442,9 +494,8 @@ app.post('/api/blogs/:id/like', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/stats', async (req, res) => {
-  await connectToDatabase();
-  
+// Get community stats
+app.get('/api/stats', ensureDbConnection, async (req, res) => {
   try {
     const totalPosts = await BlogPost.countDocuments({ status: 'published' });
     const totalUsers = await User.countDocuments();
@@ -457,7 +508,7 @@ app.get('/api/stats', async (req, res) => {
         totalPosts,
         totalUsers,
         totalLikes,
-        categories: 6
+        categories: 6 // Fixed count of categories
       }
     });
   } catch (error) {
@@ -465,9 +516,8 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-app.get('/api/categories', async (req, res) => {
-  await connectToDatabase();
-  
+// Get popular categories with post counts
+app.get('/api/categories', ensureDbConnection, async (req, res) => {
   try {
     const categories = await BlogPost.aggregate([
       { $match: { status: 'published' } },
@@ -481,13 +531,35 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Project FPV Backend is running!' });
 });
 
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// Export for Vercel serverless
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error',
+    ...(NODE_ENV === 'development' && { stack: err.stack })
+  });
+});
+
+// Export for Vercel serverless functions
 module.exports = app;
+
+// Start server only if not in Vercel production environment
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📡 API ready at http://localhost:${PORT}/api`);
+    console.log(`🌍 Environment: ${NODE_ENV}`);
+  });
+} else {
+  console.log('✅ Serverless function ready for Vercel');
+}
